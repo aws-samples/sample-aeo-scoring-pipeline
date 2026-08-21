@@ -1,0 +1,95 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Single-URL AEO analyzer on Lambda durable functions. Fetches one third-party
+  URL, parses open-standard AEO signals (Schema.org JSON-LD, RFC 9309 robots.txt
+  AI-bot access, llms.txt), scores it with Amazon Bedrock against the Osmani AEO
+  rubric, suspends for human review, then publishes to S3.
+  No VPC/ECS/ECR - the single-page fetch runs inside a Lambda step.
+
+Parameters:
+  BedrockModelId:
+    Type: String
+    Default: us.anthropic.claude-haiku-4-5-20251001-v1:0
+    Description: >
+      Bedrock model ID or inference profile ARN for AEO scoring.
+      Update this value if the default model reaches end-of-life.
+
+Globals:
+  Function:
+    Timeout: 120
+    MemorySize: 512
+    Runtime: python3.12
+
+Resources:
+
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+
+  PipelineStateTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: seo-pipeline-metadata
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  AeoAnalyzerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: aeo-analyzer
+      Handler: app.handler
+      CodeUri: ./src_aeo
+      DurableConfig:
+        ExecutionTimeout: 10800
+        RetentionPeriodInDays: 7
+      AutoPublishAlias: prod
+      Environment:
+        Variables:
+          ARTIFACTS_BUCKET: !Ref ArtifactsBucket
+          STATE_TABLE: !Ref PipelineStateTable
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          APPROVAL_GATE: "false"
+          BEDROCK_TEMPERATURE: "0"
+      Policies:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicDurableExecutionRolePolicy
+        - S3CrudPolicy:
+            BucketName: !Ref ArtifactsBucket
+        - DynamoDBCrudPolicy:
+            TableName: seo-pipeline-metadata
+        - Statement:
+            - Sid: BedrockInvoke
+              Effect: Allow
+              Action: [ bedrock:InvokeModel ]
+              Resource: "*"
+              # For production use cases handling sensitive content, consider adding
+              # Amazon Bedrock Guardrails. See: https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails.html
+
+Outputs:
+  AnalyzerAliasArn:
+    Description: Qualified alias ARN - invoke THIS for durable executions
+    Value: !Ref AeoAnalyzerFunction.Alias
+  ArtifactsBucketName:
+    Value: !Ref ArtifactsBucket
+  StateTableName:
+    Value: !Ref PipelineStateTable
